@@ -4,102 +4,120 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <arpa/nameser.h>
-#include <resolv.h>
-#include <unistd.h>
 
-#include <netdb.h>
+#include "DNS_message.h"
 
-#define DNS_PORT 12346
+#define SERVER_PORT 53
+#define BUFFER_SIZE 65536
+#define MAX_DOMAIN_SIZE 256
 
-int createUdpServer()
+
+void parse_query(unsigned char *buffer, char *domain, int sockfd, struct sockaddr_in serv_addr)
 {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sockfd < 0)
+    // Placeholder for parsing logic
+    QUERY *query = (QUERY *)buffer;
+    unsigned char *qname = query->name;
+
+    int i = 0, j = 0, k = 0;
+    while (qname[i] != 0)
     {
-        perror("Cannot create socket");
-        exit(EXIT_FAILURE);
-    }
-
-    struct sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(DNS_PORT);
-    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sockfd, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
-    {
-        perror("Bind failed");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    }
-
-    struct sockaddr_in clientAddr;
-    socklen_t addrlen = sizeof(clientAddr);
-    char buffer[512]; // DNS query size
-
-    while (1)
-    {
-        int recvLen = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&clientAddr, &addrlen);
-        if (recvLen > 0)
+        if (i != 0)
         {
-            printf("Received DNS query (%d bytes): ", recvLen);
-            for (int i = 0; i < recvLen; ++i)
-            {
-                printf("%02x ", (unsigned char)buffer[i]);
-            }
-            printf("\n");
-
-            // 解析DNS请求
-            ns_msg msg;
-            if (ns_initparse((unsigned char *)buffer, recvLen, &msg) < 0)
-            {
-                fprintf(stderr, "Failed to parse DNS query\n");
-                continue;
-            }
-
-            ns_rr rr;
-            if (ns_parserr(&msg, ns_s_qd, 0, &rr) < 0)
-            {
-                fprintf(stderr, "Failed to parse resource record\n");
-                continue;
-            }
-
-            char query_domain[NS_MAXDNAME];
-            if (ns_name_ntop(ns_rr_name(rr), query_domain, sizeof(query_domain)) < 0)
-            {
-                fprintf(stderr, "Failed to convert domain name\n");
-                continue;
-            }
-            printf("Query domain: %s\n", query_domain);
-
-            // 使用提取的域名构造DNS响应
-            unsigned char response[NS_PACKETSZ]; // Response buffer
-            int response_length;
-
-            // 初始化解析器
-            res_init();
-
-            // 发送DNS查询
-            response_length = res_query(query_domain, ns_c_in, ns_t_a, response, sizeof(response));
-
-            if (response_length < 0)
-            {
-                fprintf(stderr, "DNS query failed: %s\n", hstrerror(h_errno));
-            }
-            else
-            {
-                // 解析响应并发送回客户端
-                sendto(sockfd, response, response_length, 0, (struct sockaddr *)&clientAddr, addrlen);
-            }
+            domain[j++] = '.';
         }
+        for (k = 0; k < qname[i]; k++)
+        {
+            domain[j++] = qname[i + k + 1];
+        }
+        i += k + 1;
     }
-    return sockfd;
+    domain[j] = '\0';
+    printf("Query domain: %s\n", domain);
+
+    // Sending the query to the internet DNS server
+    if (sendto(sockfd, buffer, sizeof(DNS_HEADER) + (strlen((const char*)qname) + 1) + sizeof(QUESTION), 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    {
+        perror("Send failed");
+        exit(EXIT_FAILURE);
+    }
 }
 
 int main()
 {
-    int sockfd = createUdpServer();
-    close(sockfd);
+    int sock_r, rec;
+    struct sockaddr_in relayaddr, servaddr;
+    socklen_t len;
+    unsigned char buffer[BUFFER_SIZE];
+
+    // Create socket
+    sock_r = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_r < 0)
+    {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the socket with the server address
+    memset(&relayaddr, 0, sizeof(relayaddr));
+    relayaddr.sin_family = AF_INET;
+    relayaddr.sin_addr.s_addr = INADDR_ANY;
+    relayaddr.sin_port = htons(SERVER_PORT);
+
+    if (bind(sock_r, (const struct sockaddr *)&relayaddr, sizeof(relayaddr)) < 0)
+    {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("DNS Relay Server is running on port %d\n", SERVER_PORT);
+
+    int sock_s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_s < 0) {
+        perror("Cannot create socket");
+        exit(1);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(53); // DNS server port
+    servaddr.sin_addr.s_addr = inet_addr("8.8.8.8"); // Google's public DNS server
+
+    while (1)
+    {
+        len = sizeof(relayaddr);
+        rec = recvfrom(sock_r, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&relayaddr, &len);
+        if (rec < 0)
+        {
+            perror("Receive failed");
+            continue;
+        }
+        else
+        {
+            DNS_HEADER *heder = (DNS_HEADER *)buffer;
+            if (heder->qr == 0)
+            {
+                // Query
+                printf("Received a query\n");
+                char domain[MAX_DOMAIN_SIZE];
+                parse_query(buffer, domain, sock_s, servaddr);
+            }
+            if(heder->qr == 1)
+            {
+                // Response
+                printf("Received a response\n");
+                char ipv4[16];
+                parse_answer(buffer, ipv4,sock_r,relayaddr);
+            }
+        }
+        // Parse the query
+        // Placeholder for parsing logic
+
+        // Forward the query
+        // Placeholder for forwarding logic
+
+        // Receive the response and send it back to the client
+        // Placeholder for response handling logic
+    }
+
     return 0;
 }
