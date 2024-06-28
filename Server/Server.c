@@ -7,10 +7,9 @@
 
 #include "DNS_message.h"
 
-#define SERVER_PORT 53
+#define SERVER_PORT 12346
 #define BUFFER_SIZE 65536
 #define MAX_DOMAIN_SIZE 256
-
 
 void parse_query(unsigned char *buffer, char *domain, int sockfd, struct sockaddr_in serv_addr)
 {
@@ -35,22 +34,59 @@ void parse_query(unsigned char *buffer, char *domain, int sockfd, struct sockadd
     printf("Query domain: %s\n", domain);
 
     // Sending the query to the internet DNS server
-    if (sendto(sockfd, buffer, sizeof(DNS_HEADER) + (strlen((const char*)qname) + 1) + sizeof(QUESTION), 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    int query_size = sizeof(DNS_HEADER) + (strlen((const char *)qname) + 1) + sizeof(QUESTION);
+    if (sendto(sockfd, buffer, query_size, 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
     {
         perror("Send failed");
         exit(EXIT_FAILURE);
     }
 }
 
+void parse_response(unsigned char *buffer, char *ipv4, int sockfd, struct sockaddr_in client_addr)
+{
+    QUERY *query = (QUERY *)buffer;
+    unsigned char *qname = query->name;
+
+    // Placeholder for parsing logic
+    RES_RECORD *answer = (RES_RECORD *)buffer;
+    unsigned char *rname = answer->name;
+    unsigned char *rdata = answer->rdata;
+    
+    int i = 0, j = 0, k = 0;
+    while (rdata[i] != 0)
+    {
+        if (i != 0)
+        {
+            ipv4[j++] = '.';
+        }
+        for (int k = 0; k < rdata[i]; k++)
+        {
+            ipv4[j++] = rdata[i + k + 1];
+        }
+        i += k + 1;
+    }
+    ipv4[j] = '\0';
+    printf("IPv4 address: %s\n", ipv4);
+
+    // Send the response back to the client
+    int response_size = sizeof(DNS_HEADER) + (strlen((const char *)qname) + 1) + sizeof(QUESTION) + (strlen((const char *)rname) + 1) + sizeof(ANSWER) + (strlen((const char *)rdata) + 1);
+    if (sendto(sockfd, buffer, sizeof(DNS_HEADER) , 0, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0)
+    {
+        perror("Send failed");
+        exit(EXIT_FAILURE);
+    }
+    printf("Response sent to client\n");
+}
+
 int main()
 {
-    int sock_r, rec;
-    struct sockaddr_in relayaddr, servaddr;
+    struct sockaddr_in relayaddr, servaddr, clientaddr;
     socklen_t len;
-    unsigned char buffer[BUFFER_SIZE];
+    unsigned char buffer_q[BUFFER_SIZE]; // 请求报文
+    unsigned char buffer_r[BUFFER_SIZE]; // 回复报文
 
     // Create socket
-    sock_r = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock_r = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_r < 0)
     {
         perror("Socket creation failed");
@@ -72,51 +108,54 @@ int main()
     printf("DNS Relay Server is running on port %d\n", SERVER_PORT);
 
     int sock_s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_s < 0) {
+    if (sock_s < 0)
+    {
         perror("Cannot create socket");
         exit(1);
     }
 
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(53); // DNS server port
+    servaddr.sin_port = htons(53);                   // DNS server port
     servaddr.sin_addr.s_addr = inet_addr("8.8.8.8"); // Google's public DNS server
 
     while (1)
     {
-        len = sizeof(relayaddr);
-        rec = recvfrom(sock_r, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&relayaddr, &len);
-        if (rec < 0)
+        len = sizeof(clientaddr);
+        int query = recvfrom(sock_r, buffer_q, BUFFER_SIZE, 0, (struct sockaddr *)&clientaddr, &len);
+        if (query < 0)
         {
-            perror("Receive failed");
+            perror("Query receive failed");
             continue;
         }
         else
         {
-            DNS_HEADER *heder = (DNS_HEADER *)buffer;
-            if (heder->qr == 0)
+            printf("Received DNS query (%d bytes): ", query);
+            for (int i = 0; i < query; ++i)
             {
-                // Query
-                printf("Received a query\n");
-                char domain[MAX_DOMAIN_SIZE];
-                parse_query(buffer, domain, sock_s, servaddr);
+                printf("%02x ", (unsigned char)buffer_q[i]);
             }
-            if(heder->qr == 1)
-            {
-                // Response
-                printf("Received a response\n");
-                char ipv4[16];
-                parse_answer(buffer, ipv4,sock_r,relayaddr);
-            }
+            printf("\n");
+            // Query
+            printf("Received a query\n");
+            char domain[MAX_DOMAIN_SIZE];
+            parse_query(buffer_q, domain, sock_s, servaddr);
         }
-        // Parse the query
-        // Placeholder for parsing logic
 
-        // Forward the query
-        // Placeholder for forwarding logic
-
-        // Receive the response and send it back to the client
-        // Placeholder for response handling logic
+        len = sizeof(servaddr);
+        int response = recvfrom(sock_s, buffer_r, BUFFER_SIZE, 0, (struct sockaddr *)&servaddr, &len);
+        if (response < 0)
+        {
+            perror("Response receive failed");
+            continue;
+        }
+        else
+        {
+            // Response
+            printf("Received a response\n");
+            char ipv4[16];
+            parse_response(buffer_r, ipv4, sock_r, clientaddr);
+        }
     }
 
     return 0;
